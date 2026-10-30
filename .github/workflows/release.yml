@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # cainban-core embeds SQLite via mattn/go-sqlite3, which REQUIRES cgo. A
+  # CGO_ENABLED=0 build compiles but panics at runtime ("go-sqlite3 requires
+  # cgo"). So we cannot cross-compile from one host with CGO off; instead we
+  # build each target natively (or with its cross C toolchain) with CGO on.
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-amd64
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            goos: linux
+            goarch: arm64
+          - os: macos-13
+            target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+          - os: windows-latest
+            target: windows-amd64
+            goos: windows
+            goarch: amd64
+            ext: .exe
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.27.3'
+
+    - name: Build (CGO on)
+      shell: bash
+      env:
+        CGO_ENABLED: '1'
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+      run: |
+        VERSION="${GITHUB_REF_NAME}"
+        COMMIT="$(git rev-parse --short HEAD)"
+        DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE} -X main.builtBy=github-actions"
+        OUT="cainban-${{ matrix.target }}${{ matrix.ext }}"
+        go build -ldflags="${LDFLAGS}" -o "${OUT}" ./cmd/cainban
+        echo "ARTIFACT=${OUT}" >> "$GITHUB_ENV"
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: cainban-${{ matrix.target }}
+        path: ${{ env.ARTIFACT }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
+
+    - name: Create release
+      uses: softprops/action-gh-release@v3
+      with:
+        files: dist/*
+        generate_release_notes: true

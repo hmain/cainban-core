@@ -1,0 +1,24 @@
+# Binaries
+/bin/
+/cainban
+cainban-*-amd64
+cainban-*-arm64
+cainban-*.exe
+*.test
+*.out
+coverage.out
+
+# Local board data
+.cainban/
+
+# Go
+/vendor/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Code-intelligence caches
+.cortex/

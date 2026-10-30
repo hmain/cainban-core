@@ -1,0 +1,280 @@
+package storage
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+// DB wraps the SQLite database connection
+type DB struct {
+	conn *sql.DB
+	path string
+}
+
+// New creates a new database connection
+func New(dbPath string) (*DB, error) {
+	// Create directory if it doesn't exist
+	dir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, fmt.Errorf("failed to create database directory: %w", err)
+	}
+
+	conn, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=on&_journal_mode=WAL")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	db := &DB{
+		conn: conn,
+		path: dbPath,
+	}
+
+	if err := db.initialize(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	return db, nil
+}
+
+// NewMemory creates an in-memory database for testing
+func NewMemory() (*DB, error) {
+	conn, err := sql.Open("sqlite3", ":memory:?_foreign_keys=on")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open memory database: %w", err)
+	}
+
+	db := &DB{
+		conn: conn,
+		path: ":memory:",
+	}
+
+	if err := db.initialize(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to initialize memory database: %w", err)
+	}
+
+	return db, nil
+}
+
+// initialize creates the database schema
+func (db *DB) initialize() error {
+	schema := `
+	CREATE TABLE IF NOT EXISTS boards (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		description TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		board_id INTEGER NOT NULL,
+		board_task_id INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		description TEXT,
+		status TEXT NOT NULL DEFAULT 'todo',
+		priority INTEGER DEFAULT 0,
+		version INTEGER NOT NULL DEFAULT 0,
+		deleted_at DATETIME NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (board_id) REFERENCES boards(id) ON DELETE CASCADE,
+		UNIQUE(board_id, board_task_id)
+	);
+
+	CREATE TABLE IF NOT EXISTS task_links (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_task_id INTEGER NOT NULL,
+		to_task_id INTEGER NOT NULL,
+		link_type TEXT NOT NULL DEFAULT 'blocks',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (from_task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+		FOREIGN KEY (to_task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+		UNIQUE(from_task_id, to_task_id, link_type)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_tasks_board_id ON tasks(board_id);
+	CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+	CREATE INDEX IF NOT EXISTS idx_task_links_from ON task_links(from_task_id);
+	CREATE INDEX IF NOT EXISTS idx_task_links_to ON task_links(to_task_id);
+
+	-- Append-only activity feed: who changed what. NEVER read for task/board
+	-- state. CREATE TABLE IF NOT EXISTS is idempotent for existing databases,
+	-- so this needs no ALTER migration (brand-new table).
+	CREATE TABLE IF NOT EXISTS activity (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		board_id INTEGER NOT NULL,
+		board_task_id INTEGER NOT NULL,
+		action TEXT NOT NULL,
+		actor TEXT,
+		detail TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_activity_board ON activity(board_id, id DESC);
+
+	-- Create default board if none exists
+	INSERT OR IGNORE INTO boards (id, name, description) 
+	VALUES (1, 'Default Board', 'Default kanban board');
+	`
+
+	_, err := db.conn.Exec(schema)
+	if err != nil {
+		return err
+	}
+
+	// Handle migration for existing databases
+	return db.migrate()
+}
+
+// migrate handles database migrations for existing databases
+func (db *DB) migrate() error {
+	// Check if deleted_at and board_task_id columns exist
+	rows, err := db.conn.Query("PRAGMA table_info(tasks)")
+	if err != nil {
+		return fmt.Errorf("failed to get table info: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	hasDeletedAt := false
+	hasBoardTaskID := false
+	hasVersion := false
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, pk int
+		var defaultValue interface{}
+
+		err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk)
+		if err != nil {
+			return fmt.Errorf("failed to scan column info: %w", err)
+		}
+
+		if name == "deleted_at" {
+			hasDeletedAt = true
+		}
+		if name == "board_task_id" {
+			hasBoardTaskID = true
+		}
+		if name == "version" {
+			hasVersion = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to read table info: %w", err)
+	}
+
+	// Add deleted_at column if it doesn't exist
+	if !hasDeletedAt {
+		_, err = db.conn.Exec("ALTER TABLE tasks ADD COLUMN deleted_at DATETIME NULL")
+		if err != nil {
+			return fmt.Errorf("failed to add deleted_at column: %w", err)
+		}
+	}
+
+	// Add board_task_id column if it doesn't exist
+	if !hasBoardTaskID {
+		_, err = db.conn.Exec("ALTER TABLE tasks ADD COLUMN board_task_id INTEGER")
+		if err != nil {
+			return fmt.Errorf("failed to add board_task_id column: %w", err)
+		}
+
+		// Populate board_task_id for existing tasks
+		err = db.populateBoardTaskIDs()
+		if err != nil {
+			return fmt.Errorf("failed to populate board_task_id: %w", err)
+		}
+
+		// Add unique constraint
+		_, err = db.conn.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_board_task_id ON tasks(board_id, board_task_id)")
+		if err != nil {
+			return fmt.Errorf("failed to create board_task_id index: %w", err)
+		}
+	}
+
+	// Add version column for optimistic concurrency if it doesn't exist.
+	// Legacy rows default to 0, which the *IfVersion guards treat as the
+	// initial version so an expected_version of 0 matches an un-migrated task.
+	if !hasVersion {
+		_, err = db.conn.Exec("ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+		if err != nil {
+			return fmt.Errorf("failed to add version column: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// populateBoardTaskIDs assigns board-scoped task IDs to existing tasks
+func (db *DB) populateBoardTaskIDs() error {
+	// Get all boards
+	boards, err := db.conn.Query("SELECT id FROM boards ORDER BY id")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = boards.Close() }()
+
+	for boards.Next() {
+		var boardID int
+		if err := boards.Scan(&boardID); err != nil {
+			return err
+		}
+		if err := db.populateBoardTaskIDsForBoard(boardID); err != nil {
+			return err
+		}
+	}
+	return boards.Err()
+}
+
+// populateBoardTaskIDsForBoard assigns sequential board-scoped ids to one
+// board's tasks. Split out of populateBoardTaskIDs so the per-board rows can be
+// closed with a plain defer (one rows value per call) instead of a manual Close
+// inside a loop.
+func (db *DB) populateBoardTaskIDsForBoard(boardID int) error {
+	tasks, err := db.conn.Query("SELECT id FROM tasks WHERE board_id = ? ORDER BY created_at, id", boardID)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tasks.Close() }()
+
+	boardTaskID := 1
+	for tasks.Next() {
+		var taskID int
+		if err := tasks.Scan(&taskID); err != nil {
+			return err
+		}
+		if _, err := db.conn.Exec("UPDATE tasks SET board_task_id = ? WHERE id = ?", boardTaskID, taskID); err != nil {
+			return err
+		}
+		boardTaskID++
+	}
+	return tasks.Err()
+}
+
+// Close closes the database connection
+func (db *DB) Close() error {
+	if db.conn != nil {
+		return db.conn.Close()
+	}
+	return nil
+}
+
+// Conn returns the underlying database connection
+func (db *DB) Conn() *sql.DB {
+	return db.conn
+}
+
+// Path returns the database file path
+func (db *DB) Path() string {
+	return db.path
+}
+
+// Ping tests the database connection
+func (db *DB) Ping() error {
+	return db.conn.Ping()
+}
